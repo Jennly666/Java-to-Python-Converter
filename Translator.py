@@ -2,6 +2,73 @@ from typing import Optional
 
 INDENT_STR = "    "
 
+TYPE_MAP = {
+    "String": "str",
+    "string": "str",
+    "int": "int",
+    "Integer": "int",
+    "long": "int",
+    "short": "int",
+    "byte": "int",
+    "float": "float",
+    "double": "float",
+    "boolean": "bool",
+    "bool": "bool",
+    "char": "str",
+    "void": "None",
+}
+
+DEFAULT_FOR_TYPE = {
+    "int": "0",
+    "float": "0.0",
+    "bool": "False",
+    "str": '""',
+    "list": "[]",
+    # fallback None for unknown/custom types
+}
+
+def map_java_type_to_py(java_type: Optional[str]) -> str:
+    if not java_type:
+        return "Any"
+    jt = str(java_type).strip()
+    array_depth = jt.count("[]")
+    base = jt.replace("[]", "")
+    b_low = base.lower()
+    if b_low in ("int", "integer", "decimal_literal"):
+        py = "int"
+    elif b_low in ("float", "double", "float_literal", "hex_float_literal"):
+        py = "float"
+    elif b_low in ("boolean", "bool", "bool_literal"):
+        py = "bool"
+    elif b_low in ("char", "character"):
+        py = "str"
+    elif b_low in ("string", "text_block", "string_literal"):
+        py = "str"
+    elif b_low == "void":
+        py = "None"
+    else:
+        py = base if base else "Any"
+    for _ in range(array_depth):
+        py = f"list[{py}]"
+    return py
+
+def default_for_type(py_type: str) -> str:
+    if not py_type:
+        return "None"
+    if py_type.startswith("list["):
+        return "[]"
+    if py_type == "int":
+        return "0"
+    if py_type == "float":
+        return "0.0"
+    if py_type == "bool":
+        return "False"
+    if py_type == "str":
+        return '""'
+    if py_type == "None":
+        return "None"
+    return "None"
+
 class Translator:
     def __init__(self, indent_str: str = INDENT_STR):
         self.indent_str = indent_str
@@ -9,6 +76,37 @@ class Translator:
 
     def indent(self) -> str:
         return self.indent_str * self.indent_level
+
+    # --- helper to format literal token values reliably ---
+    def _format_literal_token(self, raw_value) -> str:
+        """Возвращает корректный Python-литерал для raw_value (строка/число/boolean/null)."""
+        if raw_value is None:
+            return '""'
+        s = str(raw_value)
+        # Если уже в кавычках — сохранить как есть
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            return s
+        # числа
+        try:
+            # int first
+            int(s)
+            return s
+        except Exception:
+            try:
+                float(s)
+                return s
+            except Exception:
+                pass
+        # булевы и null
+        if s.lower() == "null":
+            return "None"
+        if s.lower() == "true":
+            return "True"
+        if s.lower() == "false":
+            return "False"
+        # иначе считается строкой — заключаем в двойные кавычки, экранируя внутренние двойные кавычки
+        esc = s.replace('"', '\\"')
+        return f'"{esc}"'
 
     def translate(self, ast) -> str:
         return self._translate_node(ast)
@@ -51,7 +149,6 @@ class Translator:
         fn = dispatch.get(node.type, None)
         if fn:
             return fn(node)
-        # generic fallback: render children
         out_lines = []
         for c in node.children:
             if c is None:
@@ -98,16 +195,68 @@ class Translator:
 
     # ---------------- fields / init ----------------
     def _trans_field_decl(self, node):
+        """
+        node.value = string like "String a" (type and name)
+        node.children may contain:
+        - ASTNode("Init", [literalNode])  (preferred)
+        - or directly a Literal / Call / Assign node
+        Мы поддерживаем оба варианта.
+        """
         val = node.value or ""
-        parts = val.split()
-        name = parts[-1] if parts else "var"
+        # split to extract declared type and name
+        parts = (val or "").split()
+        declared_type = parts[0] if len(parts) >= 1 else None
+        name = parts[1] if len(parts) >= 2 else (None if not parts else parts[-1])
+
+        # Try to find initializer robustly:
         init_node = None
         for c in node.children:
-            if c and getattr(c, "type", None) == "Init":
+            if not c:
+                continue
+            t = getattr(c, "type", None)
+            if t == "Init":
+                # Init wrapper: child[0] is actual initializer
                 init_node = c.children[0] if c.children else None
-        if init_node:
-            expr_src = self._expr_to_source(init_node)
-            return f"{self.indent()}{name} = {expr_src}"
+                break
+            # If child is directly a literal/call/assign/etc treat it as initializer
+            if t in ("Literal", "Call", "Assign", "Identifier", "BinaryOp", "Member", "PostfixOp", "PrefixOp"):
+                init_node = c
+                break
+            # Some parsers may put initializer as Param or other wrapper; accept generic non-empty child
+            if getattr(c, "children", None):
+                # if child looks like a literal inside, pick it
+                child0 = c.children[0] if c.children else None
+                if child0 and getattr(child0, "type", None) in ("Literal", "Call", "Assign"):
+                    init_node = child0
+                    break
+
+        # Map Java declared type to Python hint
+        py_type = None
+        if declared_type:
+            py_type = TYPE_MAP.get(declared_type, None)
+            # arrays like String[] -> list[str]
+            if declared_type and declared_type.endswith("[]"):
+                base = declared_type[:-2]
+                py_base = TYPE_MAP.get(base, "object")
+                py_type = f"list[{py_base}]"
+        # If we didn't map and declared_type is present, try lowercase heuristic
+        if py_type is None and declared_type:
+            py_type = TYPE_MAP.get(declared_type.lower(), None)
+
+        # build output
+        if init_node is not None:
+            init_src = self._expr_to_source(init_node)
+            # If literal string contains quotes, _expr_to_source will keep them
+            if py_type:
+                return f"{self.indent()}{name}: {py_type} = {init_src}"
+            else:
+                return f"{self.indent()}{name} = {init_src}"
+
+        # no initializer: emit type hint + default if possible
+        if py_type:
+            default = DEFAULT_FOR_TYPE.get(py_type, "None")
+            return f"{self.indent()}{name}: {py_type} = {default}"
+        # no type mapping -> fallback
         return f"{self.indent()}{name} = None"
 
     def _trans_init_wrapper(self, node):
@@ -115,7 +264,7 @@ class Translator:
             return self._expr_to_source(node.children[0])
         return ""
 
-    # ---------------- methods ----------------
+    # ---------------- methods (не менял логику — только типы параметров/возрата) ----------------
     def _trans_method_decl(self, node):
         children = list(node.children or [])
         modifiers = []
@@ -124,20 +273,39 @@ class Translator:
             children = children[1:]
         params = [c for c in children if getattr(c, "type", None) == "Param"]
         body_nodes = [c for c in children if getattr(c, "type", None) != "Param"]
-        method_name = (node.value.split()[-1]) if node.value else "method"
+        ret_type = None
+        method_name = None
+        if node.value:
+            parts = node.value.split()
+            if len(parts) >= 2:
+                ret_type = parts[0]
+                method_name = parts[1]
+            elif len(parts) == 1:
+                method_name = parts[0]
+        if not method_name:
+            method_name = "method"
         is_static = any(m.strip().upper() == "STATIC" for m in modifiers)
-        param_names = []
+        param_items = []
         for p in params:
-            if p and getattr(p, "value", None):
-                pn = p.value.strip().split()[-1]
-                if pn in ("None", "<unknown>", "None"):
-                    pn = "arg"
-                param_names.append(pn)
+            if not getattr(p, "value", None):
+                param_items.append("arg")
+                continue
+            pv = p.value.strip()
+            parts = pv.split()
+            if len(parts) >= 2:
+                p_type_java = parts[0]
+                p_name = parts[1]
+                p_py = map_java_type_to_py(p_type_java)
+                param_items.append(f"{p_name}: {p_py}")
+            else:
+                param_items.append(parts[-1])
         if not is_static:
-            param_list = ["self"] + param_names
+            param_list = "self" + (", " + ", ".join(param_items) if param_items else "")
         else:
-            param_list = param_names
-        header = f"def {method_name}({', '.join(param_list)}):"
+            param_list = ", ".join(param_items)
+        ret_py = map_java_type_to_py(ret_type) if ret_type is not None else "None"
+        returns = f" -> {ret_py}"
+        header = f"def {method_name}({param_list}){returns}:"
         self.indent_level += 1
         body_lines = []
         if not body_nodes:
@@ -259,7 +427,7 @@ class Translator:
         return node.value or ""
 
     def _trans_literal(self, node):
-        return node.value or ""
+        return self._format_literal_token(node.value)
 
     def _trans_binaryop(self, node):
         return self._expr_to_source(node)
@@ -280,16 +448,9 @@ class Translator:
 
     # ---------------- helpers for for -> range detection ----------------
     def _get_for_init_info(self, init_node):
-        """
-        Try to extract (var_name, start_value_src) from init:
-        - FieldDecl with Init (value like 'int i' and Init child)
-        - Assign node: left Identifier, right Literal/expression
-        Otherwise return (None, None)
-        """
         if init_node is None:
             return None, None
         if getattr(init_node, "type", None) == "FieldDecl":
-            # node.value like "int i"
             parts = (init_node.value or "").split()
             var_name = parts[-1] if parts else None
             init_child = None
@@ -308,10 +469,6 @@ class Translator:
         return None, None
 
     def _get_for_update_step(self, update_node, var_name):
-        """
-        Try to determine step (int) or expression string for update node.
-        Return step (int) for simple ++/--, or string for custom update, or None.
-        """
         if update_node is None:
             return None
         if getattr(update_node, "type", None) in ("PostfixOp", "PrefixOp"):
@@ -319,21 +476,15 @@ class Translator:
                 return 1
             if update_node.value == "DEC":
                 return -1
-        # assignment style: i = i + 1 or i += 1
         if getattr(update_node, "type", None) == "BinaryOp":
-            # binary op as expression (rare for update), fallback to expression string
             return self._expr_to_source(update_node)
         if getattr(update_node, "type", None) == "Assign":
-            # right side may be BinaryOp or literal
             right = update_node.children[1] if update_node.children else None
             if getattr(right, "type", None) == "BinaryOp":
-                # if op is ADD and right is literal 1 -> step 1
                 op = right.value
                 if op == "ADD":
-                    # try to extract literal number
-                    r = right.children[1]
                     try:
-                        return int(r.value)
+                        return int(right.children[1].value)
                     except Exception:
                         return self._expr_to_source(update_node)
                 if op == "SUB":
@@ -342,20 +493,15 @@ class Translator:
                     except Exception:
                         return self._expr_to_source(update_node)
             return self._expr_to_source(update_node)
-        # fallback to whole expression string
         return self._expr_to_source(update_node)
 
     def _get_for_condition_end(self, cond_node, var_name):
-        """
-        If condition is of the form var < end (or <=, >, >=), return end expression string and comparator.
-        """
         if cond_node is None:
             return None, None
         if getattr(cond_node, "type", None) == "BinaryOp":
             left = cond_node.children[0]
             right = cond_node.children[1]
-            op = cond_node.value  # token type like 'LT', 'GT', etc.
-            # left might be Identifier matching var_name
+            op = cond_node.value
             left_name = left.value if getattr(left, "type", None) == "Identifier" else None
             if var_name is None or left_name == var_name:
                 return self._expr_to_source(right), op
@@ -364,41 +510,30 @@ class Translator:
     # ---------------- for/while/do-while ----------------
     def _trans_for_statement(self, node):
         children = node.children or []
-        # classic for: [init, condition, update, body]
         if len(children) == 4:
             init, condition, update, body = children
-            # try to extract var and start
             var_name, start_src = self._get_for_init_info(init)
             end_src, cond_op = self._get_for_condition_end(condition, var_name)
             step = self._get_for_update_step(update, var_name)
-            # if we have var_name and end_src and numeric/simple step -> produce range()
             if var_name and end_src is not None:
-                # handle <= by adding +1 — we keep simple: if comparator is LE, do end+1
                 if cond_op == "LE":
                     end_expr = f"({end_src}) + 1"
                 elif cond_op == "LT":
                     end_expr = end_src
                 else:
-                    # For other comparators fallback to while-based translation
                     end_expr = None
                 if end_expr is not None:
-                    # default start
                     if start_src is None:
                         start_src = "0"
-                    # step
                     if isinstance(step, int):
                         if step == 1:
                             step_part = ""
                         else:
                             step_part = f", {step}"
                         return f"{self.indent()}for {var_name} in range({start_src}, {end_expr}{step_part}):\n" + self._block_inside_as_lines(body)
-                    else:
-                        # If update is expression string, can't produce clean range -> fallback to while form
-                        pass
-            # Fallback: previous behavior (init as statement + while loop + update after body)
+            # fallback: init then while
             lines = []
             if init is not None:
-                # If init is FieldDecl produce assignment
                 if getattr(init, "type", None) == "FieldDecl":
                     lines.append(self._trans_field_decl(init))
                 else:
@@ -409,7 +544,6 @@ class Translator:
             cond_src = self._expr_to_source(condition) if condition is not None else "True"
             lines.append(self.indent() + f"while {cond_src}:")
             self.indent_level += 1
-            # body
             lines.append(self._translate_node(body))
             if update is not None:
                 update_src = self._expr_to_source(update)
@@ -418,7 +552,6 @@ class Translator:
                         lines.append(self.indent() + ln)
             self.indent_level -= 1
             return "\n".join(lines)
-        # foreach: [var_param, collection_expr, body]
         if len(children) == 3:
             var_node, collection_expr, body = children
             var_name = self._expr_to_source(var_node)
@@ -432,13 +565,9 @@ class Translator:
         return f"{self.indent()}# Unsupported for-statement"
 
     def _block_inside_as_lines(self, body):
-        """
-        Helper returns block body as properly indented multi-line string (body is ASTNode 'Block').
-        """
         self.indent_level += 1
         block_src = self._translate_node(body)
         self.indent_level -= 1
-        # ensure already-indented lines are present; but _translate_node returns lines with indentation
         return block_src
 
     def _trans_while_statement(self, node):
@@ -527,7 +656,28 @@ class Translator:
             return expr
         t = getattr(expr, "type", None)
         if t == "Literal":
-            return expr.value or ""
+            # we assume node.value holds token text; keep it as-is.
+            v = expr.value or ""
+            # if it's a string literal without quotes, add quotes
+            if isinstance(v, str) and v != "":
+                s = v
+                # If already quoted, keep; otherwise for alphabetic strings — quote
+                if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+                    return s
+                # if looks numeric or boolean, return as is
+                try:
+                    float(s)
+                    return s
+                except Exception:
+                    pass
+                if s.lower() in ("true", "false", "null"):
+                    # map java true/false/null
+                    if s.lower() == "null":
+                        return "None"
+                    return s.lower().capitalize() if False else s.lower()
+                # fallback: quote
+                return f'"{s}"'
+            return '""'
         if t == "Identifier":
             return expr.value or ""
         if t == "Member":
@@ -539,7 +689,8 @@ class Translator:
             base_src = self._expr_to_source(base) if base is not None else ""
             args = expr.children or []
             args_src = ", ".join(self._expr_to_source(a) for a in args)
-            if base_src.endswith(".println") or base_src == "System.out.println":
+            # map both println and print to python print (no end param)
+            if base_src.endswith(".println") or base_src.endswith(".print") or base_src == "System.out.println" or base_src == "System.out.print":
                 first = args[0] if args else None
                 arg_src = self._expr_to_source(first) if first is not None else ""
                 return f"print({arg_src})"
@@ -554,13 +705,13 @@ class Translator:
             right = expr.children[1]
             left_s = self._expr_to_source(left)
             right_s = self._expr_to_source(right)
-            # no extra parentheses to keep output clean
             return f"{left_s} {op} {right_s}"
         if t == "Assign":
             left = expr.children[0]
             right = expr.children[1]
             return f"{self._expr_to_source(left)} = {self._expr_to_source(right)}"
         if t == "Param":
+            # return param name only when used in expressions, but for signature we parse node.value
             return (expr.value or "").split()[-1]
         if t == "PostfixOp":
             base_src = self._expr_to_source(expr.children[0])
