@@ -42,6 +42,8 @@ class SimpleJavaParser:
         self.tokens = tokens
         self.current = self.tokens.LT(1)
         self._skip_ignored()
+        # имя текущего парсимого класса (используется для детекции конструкторов)
+        self._current_class_name: Optional[str] = None
 
     # --------------- utilities ---------------
     def _skip_ignored(self):
@@ -71,6 +73,43 @@ class SimpleJavaParser:
     def peek_type(self, k=1):
         t = self.tokens.LT(k)
         return t.type if t is not None else None
+
+    def _peek_token(self, k: int):
+        """Возвращает сам Token у lookahead (или None)."""
+        try:
+            return self.tokens.LT(k)
+        except Exception:
+            return None
+
+    def _peek_text(self, k: int):
+        t = self._peek_token(k)
+        return getattr(t, "text", None) if t is not None else None
+
+    def _is_constructor_start(self):
+        """
+        Проверяет, начинается ли на текущей позиции конструктор класса:
+        допускает предваряющие модификаторы и сравнивает имя с текущим классом.
+        Pattern: [modifiers]* IDENTIFIER LPAREN  и IDENTIFIER.text == self._current_class_name
+        """
+        if not self._current_class_name:
+            return False
+        i = 1
+        # пропускаем модификаторы
+        while True:
+            t = self._peek_token(i)
+            if t is None:
+                return False
+            if getattr(t, "type", None) in self.MODIFIERS:
+                i += 1
+                continue
+            break
+        t = self._peek_token(i)
+        t2 = self._peek_token(i + 1)
+        if t is None:
+            return False
+        if getattr(t, "type", None) == "IDENTIFIER" and getattr(t2, "type", None) == "LPAREN":
+            return getattr(t, "text", None) == self._current_class_name
+        return False
 
     # --------------- entry ---------------
     def parse(self):
@@ -107,37 +146,87 @@ class SimpleJavaParser:
             raise SyntaxError("Ожидался идентификатор класса, получен EOF")
         class_name = self.current.text
         self.match("IDENTIFIER")
-        self.match("LBRACE")
-        body_children = self.parse_class_body()
-        if self.current is None or self.current.type == Token.EOF:
-            raise SyntaxError(f"Unclosed class body for class {class_name} — reached EOF without '}}'")
-        self.match("RBRACE")
-        node = ASTNode("ClassDecl", class_name, body_children)
-        if modifiers:
-            node.children.insert(0, ASTNode("Modifiers", ",".join(modifiers)))
-        return node
 
-    def parse_class_body(self):
-        children = []
+        # remember current class name to detect constructors
+        self._current_class_name = class_name
+
+        self.match("LBRACE")
+        body_children = []
+
+        # parse body items (only append non-None nodes)
         while self.current is not None and self.current.type not in ("RBRACE", Token.EOF):
-            # method or field or inner block
             if (self.current.type in self.MODIFIERS or
                 self.current.type in self.TYPE_KEYWORDS or
                 self.current.type == "IDENTIFIER" or
                 self.current.type == "VOID"):
-                if self._looks_like_method_decl():
-                    children.append(self.parse_method_declaration())
+
+                # --- constructor has priority ---
+                if self._is_constructor_start():
+                    node = self.parse_constructor_declaration()
+                    if node:
+                        body_children.append(node)
+                # method (has explicit return type or VOID)
+                elif self._looks_like_method_decl():
+                    node = self.parse_method_declaration()
+                    if node:
+                        body_children.append(node)
                 else:
-                    children.append(self.parse_field_declaration())
+                    node = self.parse_field_declaration()
+                    if node:
+                        body_children.append(node)
             else:
                 if self.current.type == "LBRACE":
-                    # parse block and wrap into AST Block node
                     stmts = self.parse_block()
-                    children.append(ASTNode("Block", children=stmts))
+                    body_children.append(ASTNode("Block", children=stmts))
                 else:
-                    # skip unknown token
                     self.advance()
-        return children
+
+        if self.current is None or self.current.type == Token.EOF:
+            raise SyntaxError(f"Unclosed class body for class {class_name} — reached EOF without '}}'")
+
+        self.match("RBRACE")
+
+        node = ASTNode("ClassDecl", class_name, body_children)
+        if modifiers:
+            node.children.insert(0, ASTNode("Modifiers", ",".join(modifiers)))
+
+        # clear current class name
+        self._current_class_name = None
+        return node
+
+    def parse_constructor_declaration(self):
+        """
+        Parse constructor like: [modifiers] ClassName ( params ) { body }
+        Returns ASTNode("ConstructorDecl", constructorName, params+body)
+        """
+        modifiers = []
+        # съесть модификаторы, если есть
+        while self.current is not None and self.current.type in self.MODIFIERS:
+            modifiers.append(self.current.type)
+            self.advance()
+
+        # имя конструктора должно быть IDENTIFIER (и совпадать с текущим классом — проверяли ранее)
+        if self.current is None or self.current.type != "IDENTIFIER":
+            raise SyntaxError("Ожидалось имя конструктора, получен EOF/другое")
+        constructor_name = self.current.text
+        self.match("IDENTIFIER")
+
+        # params
+        self.match("LPAREN")
+        params = self.parse_parameter_list()
+        self.match("RPAREN")
+
+        # тело конструктора
+        body = []
+        if self.current and self.current.type == "LBRACE":
+            body = self.parse_block()
+        else:
+            body = []
+
+        node = ASTNode("ConstructorDecl", constructor_name, params + body)
+        if modifiers:
+            node.children.insert(0, ASTNode("Modifiers", ",".join(modifiers)))
+        return node
 
     def _looks_like_method_decl(self):
         # пропускаем модификаторы при просмотре
@@ -152,43 +241,43 @@ class SimpleJavaParser:
 
     # --------------- fields / locals ---------------
     def parse_field_declaration(self):
-            # Обрабатываем варианты: [modifiers] Type name [= expr] ;
-            type_tok = self.current.text if self.current is not None else None
-            if self.current and self.current.type in self.MODIFIERS:
-                while self.current and self.current.type in self.MODIFIERS:
-                    self.advance()
-            if self.current and (self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER"):
-                type_tok = self.current.text
+        # Обрабатываем варианты: [modifiers] Type name [= expr] ;
+        type_tok = self.current.text if self.current is not None else None
+        if self.current and self.current.type in self.MODIFIERS:
+            while self.current and self.current.type in self.MODIFIERS:
                 self.advance()
-                # массивы []
-                while self.current and self.current.type == "LBRACK":
+        if self.current and (self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER"):
+            type_tok = self.current.text
+            self.advance()
+            # массивы []
+            while self.current and self.current.type == "LBRACK":
+                self.advance()
+                if self.current and self.current.type == "RBRACK":
+                    type_tok = (type_tok or "") + "[]"
                     self.advance()
-                    if self.current and self.current.type == "RBRACK":
-                        type_tok = (type_tok or "") + "[]"
-                        self.advance()
-            else:
-                # fallback: skip token
-                if self.current:
-                    self.advance()
-
-            name = None
-            if self.current and self.current.type == "IDENTIFIER":
-                name = self.current.text
+        else:
+            # fallback: skip token
+            if self.current:
                 self.advance()
 
-            init = None
-            if self.accept("ASSIGN"):
-                init = self.parse_expression()
+        name = None
+        if self.current and self.current.type == "IDENTIFIER":
+            name = self.current.text
+            self.advance()
 
-            if self.current and self.current.type == "SEMI":
-                self.advance()
+        init = None
+        if self.accept("ASSIGN"):
+            init = self.parse_expression()
 
-            # IMPORTANT: place initializer as child of Init node (not in value)
-            if init is not None:
-                init_wrapper = ASTNode("Init", None, [init])
-                return ASTNode("FieldDecl", f"{type_tok} {name}", [init_wrapper])
-            else:
-                return ASTNode("FieldDecl", f"{type_tok} {name}", [])
+        if self.current and self.current.type == "SEMI":
+            self.advance()
+
+        # IMPORTANT: place initializer as child of Init node (not in value)
+        if init is not None:
+            init_wrapper = ASTNode("Init", None, [init])
+            return ASTNode("FieldDecl", f"{type_tok} {name}", [init_wrapper])
+        else:
+            return ASTNode("FieldDecl", f"{type_tok} {name}", [])
 
     def parse_local_variable_declaration_no_semi(self):
         # like field parse but without trailing ';'
