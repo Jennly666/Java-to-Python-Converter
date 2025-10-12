@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Any
 
 INDENT_STR = "    "
 
@@ -24,7 +24,6 @@ DEFAULT_FOR_TYPE = {
     "bool": "False",
     "str": '""',
     "list": "[]",
-    # fallback None for unknown/custom types
 }
 
 def map_java_type_to_py(java_type: Optional[str]) -> str:
@@ -47,6 +46,7 @@ def map_java_type_to_py(java_type: Optional[str]) -> str:
     elif b_low == "void":
         py = "None"
     else:
+        # unknown custom type -> keep original base (best-effort)
         py = base if base else "Any"
     for _ in range(array_depth):
         py = f"list[{py}]"
@@ -73,22 +73,18 @@ class Translator:
     def __init__(self, indent_str: str = INDENT_STR):
         self.indent_str = indent_str
         self.indent_level = 0
+        self._in_constructor = False
 
     def indent(self) -> str:
         return self.indent_str * self.indent_level
 
-    # --- helper to format literal token values reliably ---
     def _format_literal_token(self, raw_value) -> str:
-        """Возвращает корректный Python-литерал для raw_value (строка/число/boolean/null)."""
         if raw_value is None:
             return '""'
         s = str(raw_value)
-        # Если уже в кавычках — сохранить как есть
         if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
             return s
-        # числа
         try:
-            # int first
             int(s)
             return s
         except Exception:
@@ -97,14 +93,12 @@ class Translator:
                 return s
             except Exception:
                 pass
-        # булевы и null
         if s.lower() == "null":
             return "None"
         if s.lower() == "true":
             return "True"
         if s.lower() == "false":
             return "False"
-        # иначе считается строкой — заключаем в двойные кавычки, экранируя внутренние двойные кавычки
         esc = s.replace('"', '\\"')
         return f'"{esc}"'
 
@@ -119,6 +113,7 @@ class Translator:
             "ClassDecl": self._trans_class_decl,
             "Modifiers": self._trans_modifiers,
             "MethodDecl": self._trans_method_decl,
+            "ConstructorDecl": self._trans_constructor_decl,
             "Param": self._trans_param,
             "FieldDecl": self._trans_field_decl,
             "Init": self._trans_init_wrapper,
@@ -145,6 +140,7 @@ class Translator:
             "DefaultLabel": self._trans_default_label,
             "PostfixOp": self._trans_postfixop,
             "PrefixOp": self._trans_prefixop,
+            "Ternary": self._trans_ternary if hasattr(self, "_trans_ternary") else None,
         }
         fn = dispatch.get(node.type, None)
         if fn:
@@ -159,7 +155,7 @@ class Translator:
                 out_lines.append(self._translate_node(c))
         return "\n".join([l for l in out_lines if l is not None and l != ""])
 
-    # ---------------- top-level ----------------
+    # --- top-level ---
     def _trans_compilation_unit(self, node):
         parts = []
         for child in node.children:
@@ -193,70 +189,60 @@ class Translator:
     def _trans_modifiers(self, node):
         return f"# modifiers: {node.value}"
 
-    # ---------------- fields / init ----------------
+    # --- fields ---
     def _trans_field_decl(self, node):
-        """
-        node.value = string like "String a" (type and name)
-        node.children may contain:
-        - ASTNode("Init", [literalNode])  (preferred)
-        - or directly a Literal / Call / Assign node
-        Мы поддерживаем оба варианта.
-        """
         val = node.value or ""
-        # split to extract declared type and name
         parts = (val or "").split()
-        declared_type = parts[0] if len(parts) >= 1 else None
-        name = parts[1] if len(parts) >= 2 else (None if not parts else parts[-1])
+        if len(parts) >= 2:
+            declared_type = " ".join(parts[:-1])
+            name = parts[-1]
+        elif len(parts) == 1:
+            declared_type = parts[0]
+            name = "var"
+        else:
+            declared_type = None
+            name = "var"
 
-        # Try to find initializer robustly:
+        # find initializer (Init wrapper preferred)
         init_node = None
         for c in node.children:
             if not c:
                 continue
             t = getattr(c, "type", None)
             if t == "Init":
-                # Init wrapper: child[0] is actual initializer
                 init_node = c.children[0] if c.children else None
                 break
-            # If child is directly a literal/call/assign/etc treat it as initializer
             if t in ("Literal", "Call", "Assign", "Identifier", "BinaryOp", "Member", "PostfixOp", "PrefixOp"):
                 init_node = c
                 break
-            # Some parsers may put initializer as Param or other wrapper; accept generic non-empty child
+            # generic fallback
             if getattr(c, "children", None):
-                # if child looks like a literal inside, pick it
                 child0 = c.children[0] if c.children else None
                 if child0 and getattr(child0, "type", None) in ("Literal", "Call", "Assign"):
                     init_node = child0
                     break
 
-        # Map Java declared type to Python hint
         py_type = None
         if declared_type:
             py_type = TYPE_MAP.get(declared_type, None)
-            # arrays like String[] -> list[str]
-            if declared_type and declared_type.endswith("[]"):
+            if declared_type.endswith("[]"):
                 base = declared_type[:-2]
-                py_base = TYPE_MAP.get(base, "object")
+                py_base = TYPE_MAP.get(base, base)
                 py_type = f"list[{py_base}]"
-        # If we didn't map and declared_type is present, try lowercase heuristic
         if py_type is None and declared_type:
             py_type = TYPE_MAP.get(declared_type.lower(), None)
 
-        # build output
         if init_node is not None:
             init_src = self._expr_to_source(init_node)
-            # If literal string contains quotes, _expr_to_source will keep them
             if py_type:
                 return f"{self.indent()}{name}: {py_type} = {init_src}"
             else:
                 return f"{self.indent()}{name} = {init_src}"
 
-        # no initializer: emit type hint + default if possible
+        # no initializer
         if py_type:
             default = DEFAULT_FOR_TYPE.get(py_type, "None")
             return f"{self.indent()}{name}: {py_type} = {default}"
-        # no type mapping -> fallback
         return f"{self.indent()}{name} = None"
 
     def _trans_init_wrapper(self, node):
@@ -264,7 +250,7 @@ class Translator:
             return self._expr_to_source(node.children[0])
         return ""
 
-    # ---------------- methods (не менял логику — только типы параметров/возрата) ----------------
+    # --- method ---
     def _trans_method_decl(self, node):
         children = list(node.children or [])
         modifiers = []
@@ -285,27 +271,28 @@ class Translator:
         if not method_name:
             method_name = "method"
         is_static = any(m.strip().upper() == "STATIC" for m in modifiers)
+
         param_items = []
         for p in params:
-            if not getattr(p, "value", None):
-                param_items.append("arg")
-                continue
-            pv = p.value.strip()
+            pv = p.value.strip() if getattr(p, "value", None) else ""
             parts = pv.split()
             if len(parts) >= 2:
-                p_type_java = parts[0]
-                p_name = parts[1]
+                p_type_java = " ".join(parts[:-1])
+                p_name = parts[-1]
                 p_py = map_java_type_to_py(p_type_java)
                 param_items.append(f"{p_name}: {p_py}")
             else:
-                param_items.append(parts[-1])
+                param_items.append(parts[-1] if parts else "arg")
+
         if not is_static:
             param_list = "self" + (", " + ", ".join(param_items) if param_items else "")
         else:
             param_list = ", ".join(param_items)
+
         ret_py = map_java_type_to_py(ret_type) if ret_type is not None else "None"
         returns = f" -> {ret_py}"
         header = f"def {method_name}({param_list}){returns}:"
+
         self.indent_level += 1
         body_lines = []
         if not body_nodes:
@@ -321,18 +308,65 @@ class Translator:
                     else:
                         body_lines.append(self.indent() + line)
         self.indent_level -= 1
+
+        result = []
         if is_static:
-            dec = f"{self.indent()}@staticmethod"
-            def_line = f"{self.indent()}{header}"
-            return dec + "\n" + def_line + "\n" + "\n".join(body_lines)
+            result.append(f"{self.indent()}@staticmethod")
+            result.append(f"{self.indent()}{header}")
         else:
-            def_line = f"{self.indent()}{header}"
-            return def_line + "\n" + "\n".join(body_lines)
+            result.append(f"{self.indent()}{header}")
+        result.extend(body_lines)
+        return "\n".join(result)
+
+    def _trans_constructor_decl(self, node):
+        # remove Modifiers node if present (we don't want modifiers printed inside body)
+        children = list(node.children or [])
+        if children and getattr(children[0], "type", None) == "Modifiers":
+            children = children[1:]
+        params = [c for c in children if getattr(c, "type", None) == "Param"]
+        body_nodes = [c for c in children if getattr(c, "type", None) != "Param"]
+
+        # build params with types
+        param_parts = []
+        for p in params:
+            pv = p.value.strip() if getattr(p, "value", None) else ""
+            parts = pv.split()
+            if len(parts) >= 2:
+                p_type_java = " ".join(parts[:-1])
+                p_name = parts[-1]
+                p_py = map_java_type_to_py(p_type_java)
+                param_parts.append(f"{p_name}: {p_py}")
+            else:
+                param_parts.append(parts[-1] if parts else "arg")
+
+        header = f"def __init__(self{', ' if param_parts else ''}{', '.join(param_parts)}):"
+
+        # render body with constructor context so field assignments become self.x
+        self._in_constructor = True
+        self.indent_level += 1
+        body_lines = []
+        if not body_nodes:
+            body_lines.append(self.indent() + "pass")
+        else:
+            for b in body_nodes:
+                rendered = self._translate_node(b)
+                if not rendered:
+                    continue
+                for line in rendered.splitlines():
+                    if line.startswith(self.indent()):
+                        body_lines.append(line)
+                    else:
+                        body_lines.append(self.indent() + line)
+        self.indent_level -= 1
+        self._in_constructor = False
+
+        result = [f"{self.indent()}{header}"] + body_lines
+        return "\n".join(result)
 
     def _trans_param(self, node):
         return node.value or ""
 
-    # ---------------- blocks / statements ----------------
+    # --- blocks / statements ---
     def _trans_block(self, node):
         if not node.children:
             return self.indent() + "pass"
@@ -383,16 +417,10 @@ class Translator:
         return "\n".join(lines)
 
     def _trans_then(self, node):
-        lines = []
-        for c in node.children:
-            lines.append(self._translate_node(c))
-        return "\n".join(lines)
+        return "\n".join(self._translate_node(c) for c in node.children)
 
     def _trans_else(self, node):
-        lines = []
-        for c in node.children:
-            lines.append(self._translate_node(c))
-        return "\n".join(lines)
+        return "\n".join(self._translate_node(c) for c in node.children)
 
     def _trans_return(self, node):
         if node.children:
@@ -405,7 +433,6 @@ class Translator:
     def _trans_continue(self, node):
         return f"{self.indent()}continue"
 
-    # ---------------- expressions / calls / members ----------------
     def _trans_expr_stmt(self, node):
         if node.children:
             expr = node.children[0]
@@ -436,7 +463,6 @@ class Translator:
         text = node.value if node.value is not None else ""
         return f"{self.indent()}# Unknown node: {text}"
 
-    # ---------------- assign ----------------
     def _trans_assign(self, node):
         if not node.children or len(node.children) < 2:
             return f"{self.indent()}# malformed assign"
@@ -444,6 +470,9 @@ class Translator:
         right = node.children[1]
         left_src = self._expr_to_source(left)
         right_src = self._expr_to_source(right)
+        # constructor context: prefix bare identifiers with self.
+        if self._in_constructor and getattr(left, "type", None) == "Identifier":
+            left_src = f"self.{left_src}"
         return f"{self.indent()}{left_src} = {right_src}"
 
     # ---------------- helpers for for -> range detection ----------------
@@ -656,28 +685,8 @@ class Translator:
             return expr
         t = getattr(expr, "type", None)
         if t == "Literal":
-            # we assume node.value holds token text; keep it as-is.
             v = expr.value or ""
-            # if it's a string literal without quotes, add quotes
-            if isinstance(v, str) and v != "":
-                s = v
-                # If already quoted, keep; otherwise for alphabetic strings — quote
-                if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-                    return s
-                # if looks numeric or boolean, return as is
-                try:
-                    float(s)
-                    return s
-                except Exception:
-                    pass
-                if s.lower() in ("true", "false", "null"):
-                    # map java true/false/null
-                    if s.lower() == "null":
-                        return "None"
-                    return s.lower().capitalize() if False else s.lower()
-                # fallback: quote
-                return f'"{s}"'
-            return '""'
+            return self._format_literal_token(v)
         if t == "Identifier":
             return expr.value or ""
         if t == "Member":
@@ -689,11 +698,16 @@ class Translator:
             base_src = self._expr_to_source(base) if base is not None else ""
             args = expr.children or []
             args_src = ", ".join(self._expr_to_source(a) for a in args)
-            # map both println and print to python print (no end param)
-            if base_src.endswith(".println") or base_src.endswith(".print") or base_src == "System.out.println" or base_src == "System.out.print":
+            # println -> print(...)
+            if base_src.endswith(".println") or base_src == "System.out.println":
                 first = args[0] if args else None
                 arg_src = self._expr_to_source(first) if first is not None else ""
                 return f"print({arg_src})"
+            # print without newline
+            if base_src.endswith(".print") or base_src == "System.out.print":
+                first = args[0] if args else None
+                arg_src = self._expr_to_source(first) if first is not None else ""
+                return f"print({arg_src}, end='')"
             return f"{base_src}({args_src})"
         if t == "BinaryOp":
             op_map = {
@@ -709,9 +723,12 @@ class Translator:
         if t == "Assign":
             left = expr.children[0]
             right = expr.children[1]
-            return f"{self._expr_to_source(left)} = {self._expr_to_source(right)}"
+            left_s = self._expr_to_source(left)
+            right_s = self._expr_to_source(right)
+            if self._in_constructor and getattr(left, "type", None) == "Identifier":
+                left_s = f"self.{left_s}"
+            return f"{left_s} = {right_s}"
         if t == "Param":
-            # return param name only when used in expressions, but for signature we parse node.value
             return (expr.value or "").split()[-1]
         if t == "PostfixOp":
             base_src = self._expr_to_source(expr.children[0])
@@ -727,6 +744,11 @@ class Translator:
             if expr.value == "DEC":
                 return f"{base_src} -= 1"
             return base_src
+        if t == "Ternary":
+            cond = expr.children[0]
+            texpr = expr.children[1]
+            fexpr = expr.children[2]
+            return f"{self._expr_to_source(texpr)} if {self._expr_to_source(cond)} else {self._expr_to_source(fexpr)}"
         if t == "FieldDecl":
             s = self._trans_field_decl(expr)
             return s.strip()
