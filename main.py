@@ -1,21 +1,46 @@
-from FileStream import FileStream
-from JavaGrammarLexer import JavaGrammarLexer
-from TokenStream import TokenStream
-from SimpleJavaParser import SimpleJavaParser
-from Translator import Translator
+from FileStream.FileStream import FileStream
+from JavaGrammarLexer.JavaGrammarLexer import JavaGrammarLexer
+from TokenStream.TokenStream import TokenStream
+from SimpleJavaParser.SimpleJavaParser import SimpleJavaParser
+from Translator.Translator import Translator
 
-input_stream = FileStream("input.java")
 
-lexer = JavaGrammarLexer(input_stream)
+testing = ['simple_class',
+           'constructor_this',
+           'constructor_this_noinit',
+           'main_prints',
+           'loops',
+           'ifs',
+           'switch',
+           'expressions',
+           'arrays_and_generics',
+           'try_catch',
+           'constructor_overload',
+           'field_static_final',
+           'method_overloading'
+           ]
 
-tokens = TokenStream(lexer)
+def Translate(file_name: str):
+    input_stream = FileStream('Tests/' + file_name + '.java')
 
-parser = SimpleJavaParser(tokens)
+    lexer = JavaGrammarLexer(input_stream)
 
-ast = parser.parse()
+    tokens = TokenStream(lexer)
 
-# print(ast)
+    parser = SimpleJavaParser(tokens)
 
-t = Translator()
-python_code = t.translate(ast)
-print(python_code)
+    ast = parser.parse()
+
+    t = Translator()
+
+    python_code = t.translate(ast)
+
+    print(python_code)
+
+
+for i in testing:
+    try:
+        Translate(i)
+        print('_' * 8 + '\n' * 2)
+    finally:
+        continue
