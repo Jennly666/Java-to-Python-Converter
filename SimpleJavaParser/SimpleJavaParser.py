@@ -19,14 +19,8 @@ class ASTNode:
                 s += "\n" + ("  " * (level + 1)) + repr(child)
         return s
 
+
 class SimpleJavaParser:
-    """
-    Упрощённый, но устойчивый парсер Java-подмножества.
-    Ожидает TokenStream с методами:
-      - LT(k) -> Token (lookahead)
-      - consume() -> advance pointer
-    Возвращает ASTNode-дерево, совместимое с Translator.py
-    """
     IGNORED = {"COMMENT", "LINE_COMMENT", "WS"}
     MODIFIERS = {"PUBLIC", "PRIVATE", "PROTECTED", "STATIC", "FINAL", "ABSTRACT"}
     TYPE_KEYWORDS = {"INT", "FLOAT", "DOUBLE", "BOOLEAN", "CHAR", "VOID", "STRING"}
@@ -35,19 +29,19 @@ class SimpleJavaParser:
         "ADD": 50, "SUB": 50,
         "GT": 40, "LT": 40, "GE": 40, "LE": 40,
         "EQUAL": 30, "NOTEQUAL": 30,
-        "AND": 20, "OR": 10
+        "AND": 20, "OR": 10,
+        "BITAND": 5, "BITOR": 5, "CARET": 5,
+        "LSHIFT": 5, "RSHIFT": 5, "URSHIFT": 5,
     }
 
     def __init__(self, tokens):
         self.tokens = tokens
         self.current = self.tokens.LT(1)
         self._skip_ignored()
-        # имя текущего парсимого класса (используется для детекции конструкторов)
         self._current_class_name: Optional[str] = None
 
     # --------------- utilities ---------------
     def _skip_ignored(self):
-        # Продвигаем пока текущий токен — игнорируемый (комментарий/WS)
         while self.current is not None and getattr(self.current, "type", None) in self.IGNORED:
             self.tokens.consume()
             self.current = self.tokens.LT(1)
@@ -75,7 +69,6 @@ class SimpleJavaParser:
         return t.type if t is not None else None
 
     def _peek_token(self, k: int):
-        """Возвращает сам Token у lookahead (или None)."""
         try:
             return self.tokens.LT(k)
         except Exception:
@@ -85,16 +78,34 @@ class SimpleJavaParser:
         t = self._peek_token(k)
         return getattr(t, "text", None) if t is not None else None
 
+    def _maybe_generic_suffix(self, base_type: str) -> str:
+        """
+        Склеиваем 'List < String , Integer >' -> 'List<String,Integer>'.
+        """
+        if not (self.current and getattr(self.current, "type", None) == "LT"):
+            return base_type
+        depth = 0
+        out = [base_type]
+        while self.current and self.current.type != Token.EOF:
+            t = self.current
+            if t.type == "LT":
+                depth += 1; out.append("<")
+            elif t.type == "GT":
+                depth -= 1; out.append(">")
+            else:
+                out.append(getattr(t, "text", t.type))
+            self.advance()
+            if depth == 0:
+                break
+        return "".join(out).replace(" ", "")
+
     def _is_constructor_start(self):
         """
-        Проверяет, начинается ли на текущей позиции конструктор класса:
-        допускает предваряющие модификаторы и сравнивает имя с текущим классом.
-        Pattern: [modifiers]* IDENTIFIER LPAREN  и IDENTIFIER.text == self._current_class_name
+        [modifiers]* IDENTIFIER '('  и имя == текущему классу
         """
         if not self._current_class_name:
             return False
         i = 1
-        # пропускаем модификаторы
         while True:
             t = self._peek_token(i)
             if t is None:
@@ -111,6 +122,15 @@ class SimpleJavaParser:
             return getattr(t, "text", None) == self._current_class_name
         return False
 
+    def _looks_like_method_decl(self):
+        i = 1
+        while self.peek_type(i) in self.MODIFIERS:
+            i += 1
+        if self.peek_type(i) in self.TYPE_KEYWORDS or self.peek_type(i) == "VOID" or self.peek_type(i) == "IDENTIFIER":
+            if self.peek_type(i + 1) == "IDENTIFIER" and self.peek_type(i + 2) == "LPAREN":
+                return True
+        return False
+
     # --------------- entry ---------------
     def parse(self):
         return self.parse_compilation_unit()
@@ -125,7 +145,6 @@ class SimpleJavaParser:
                 else:
                     self.advance()
             else:
-                # skip unexpected
                 self.advance()
         return ASTNode("CompilationUnit", children=children)
 
@@ -147,25 +166,32 @@ class SimpleJavaParser:
         class_name = self.current.text
         self.match("IDENTIFIER")
 
-        # remember current class name to detect constructors
+        # extends (одна база)
+        bases = []
+        if self.accept("EXTENDS"):
+            if self.current and self.current.type == "IDENTIFIER":
+                base = self.current.text
+                self.advance()
+                bases.append(base)
+
         self._current_class_name = class_name
 
         self.match("LBRACE")
         body_children = []
 
-        # parse body items (only append non-None nodes)
+        if bases:
+            body_children.append(ASTNode("Base", ",".join(bases)))
+
         while self.current is not None and self.current.type not in ("RBRACE", Token.EOF):
             if (self.current.type in self.MODIFIERS or
                 self.current.type in self.TYPE_KEYWORDS or
                 self.current.type == "IDENTIFIER" or
                 self.current.type == "VOID"):
 
-                # --- constructor has priority ---
                 if self._is_constructor_start():
                     node = self.parse_constructor_declaration()
                     if node:
                         body_children.append(node)
-                # method (has explicit return type or VOID)
                 elif self._looks_like_method_decl():
                     node = self.parse_method_declaration()
                     if node:
@@ -190,140 +216,202 @@ class SimpleJavaParser:
         if modifiers:
             node.children.insert(0, ASTNode("Modifiers", ",".join(modifiers)))
 
-        # clear current class name
         self._current_class_name = None
         return node
 
     def parse_constructor_declaration(self):
-        """
-        Parse constructor like: [modifiers] ClassName ( params ) { body }
-        Returns ASTNode("ConstructorDecl", constructorName, params+body)
-        """
         modifiers = []
-        # съесть модификаторы, если есть
         while self.current is not None and self.current.type in self.MODIFIERS:
             modifiers.append(self.current.type)
             self.advance()
 
-        # имя конструктора должно быть IDENTIFIER (и совпадать с текущим классом — проверяли ранее)
         if self.current is None or self.current.type != "IDENTIFIER":
-            raise SyntaxError("Ожидалось имя конструктора, получен EOF/другое")
+            raise SyntaxError("Ожидалось имя конструктора")
         constructor_name = self.current.text
         self.match("IDENTIFIER")
 
-        # params
         self.match("LPAREN")
         params = self.parse_parameter_list()
         self.match("RPAREN")
 
-        # тело конструктора
         body = []
         if self.current and self.current.type == "LBRACE":
             body = self.parse_block()
-        else:
-            body = []
 
         node = ASTNode("ConstructorDecl", constructor_name, params + body)
         if modifiers:
             node.children.insert(0, ASTNode("Modifiers", ",".join(modifiers)))
         return node
 
-    def _looks_like_method_decl(self):
-        # пропускаем модификаторы при просмотре
-        i = 1
-        while self.peek_type(i) in self.MODIFIERS:
-            i += 1
-        # ожидаем тип/void/ident, затем IDENTIFIER (name) и LPAREN
-        if self.peek_type(i) in self.TYPE_KEYWORDS or self.peek_type(i) == "VOID" or self.peek_type(i) == "IDENTIFIER":
-            if self.peek_type(i + 1) == "IDENTIFIER" and self.peek_type(i + 2) == "LPAREN":
-                return True
-        return False
-
     # --------------- fields / locals ---------------
     def parse_field_declaration(self):
-        # Обрабатываем варианты: [modifiers] Type name [= expr] ;
-        type_tok = self.current.text if self.current is not None else None
-        if self.current and self.current.type in self.MODIFIERS:
-            while self.current and self.current.type in self.MODIFIERS:
-                self.advance()
+        mods = []
+        while self.current and self.current.type in self.MODIFIERS:
+            mods.append(self.current.type); self.advance()
+
+        # тип
+        type_tok = None
         if self.current and (self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER"):
-            type_tok = self.current.text
-            self.advance()
-            # массивы []
+            type_tok = self.current.text; self.advance()
+            # generics
+            type_tok = self._maybe_generic_suffix(type_tok)
+            # массивные скобки после типа
             while self.current and self.current.type == "LBRACK":
                 self.advance()
                 if self.current and self.current.type == "RBRACK":
-                    type_tok = (type_tok or "") + "[]"
                     self.advance()
+                    type_tok = (type_tok or "") + "[]"
+                else:
+                    break
         else:
-            # fallback: skip token
             if self.current:
                 self.advance()
+            return ASTNode("FieldDecl", f"{type_tok} var", [])
 
-        name = None
-        if self.current and self.current.type == "IDENTIFIER":
-            name = self.current.text
-            self.advance()
+        decls = []
+        while True:
+            if not (self.current and self.current.type == "IDENTIFIER"):
+                break
+            name = self.current.text; self.advance()
 
-        init = None
-        if self.accept("ASSIGN"):
-            init = self.parse_expression()
+            init = None
+            if self.accept("ASSIGN"):
+                # new-массив
+                if self.current and self.current.type == "NEW":
+                    self.advance()
+                    if self.current and (self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER"):
+                        _ = self.current.text; self.advance()
+                        _ = self._maybe_generic_suffix(_)
+                    while self.current and self.current.type == "LBRACK":
+                        self.advance()
+                        if self.current and self.current.type != "RBRACK":
+                            _ = self.parse_expression()
+                        self.match("RBRACK")
+                    if self.current and self.current.type == "LBRACE":
+                        self.advance()
+                        elems = []
+                        while self.current and self.current.type != "RBRACE":
+                            elems.append(self.parse_expression())
+                            if self.current and self.current.type == "COMMA":
+                                self.advance()
+                        self.match("RBRACE")
+                        init = ASTNode("ArrayInit", None, elems)
+                    else:
+                        init = ASTNode("Unknown", "new-array")
+                # короткая форма { ... }
+                elif self.current and self.current.type == "LBRACE":
+                    self.advance()
+                    elems = []
+                    while self.current and self.current.type != "RBRACE":
+                        elems.append(self.parse_expression())
+                        if self.current and self.current.type == "COMMA":
+                            self.advance()
+                    self.match("RBRACE")
+                    init = ASTNode("ArrayInit", None, elems)
+                else:
+                    init = self.parse_expression()
+
+            fd_children = []
+            if mods:
+                fd_children.append(ASTNode("Modifiers", ",".join(mods)))
+            if init is not None:
+                fd_children.append(ASTNode("Init", None, [init]))
+            decls.append(ASTNode("FieldDecl", f"{type_tok} {name}", fd_children))
+
+            if self.current and self.current.type == "COMMA":
+                self.advance()
+                continue
+            break
 
         if self.current and self.current.type == "SEMI":
             self.advance()
 
-        # IMPORTANT: place initializer as child of Init node (not in value)
-        if init is not None:
-            init_wrapper = ASTNode("Init", None, [init])
-            return ASTNode("FieldDecl", f"{type_tok} {name}", [init_wrapper])
-        else:
-            return ASTNode("FieldDecl", f"{type_tok} {name}", [])
+        return decls[0] if len(decls) == 1 else ASTNode("Block", children=decls)
 
     def parse_local_variable_declaration_no_semi(self):
-        # like field parse but without trailing ';'
-        type_tok = None
-        if self.current and self.current.type in self.MODIFIERS:
-            while self.current and self.current.type in self.MODIFIERS:
-                self.advance()
-        if self.current and (self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER"):
-            type_tok = self.current.text
+        while self.current and self.current.type in self.MODIFIERS:
             self.advance()
+
+        type_tok = None
+        if self.current and (self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER"):
+            type_tok = self.current.text; self.advance()
+            type_tok = self._maybe_generic_suffix(type_tok)
             while self.current and self.current.type == "LBRACK":
                 self.advance()
                 if self.current and self.current.type == "RBRACK":
-                    type_tok = (type_tok or "") + "[]"
                     self.advance()
-        name = None
-        if self.current and self.current.type == "IDENTIFIER":
-            name = self.current.text
-            self.advance()
-        init = None
-        if self.accept("ASSIGN"):
-            init = self.parse_expression()
+                    type_tok = (type_tok or "") + "[]"
+                else:
+                    break
+        else:
+            return ASTNode("FieldDecl", f"{type_tok} var", [])
 
-        # Wrap initializer as child
-        if init is not None:
-            init_wrapper = ASTNode("Init", None, [init])
-            return ASTNode("FieldDecl", f"{type_tok} {name}", [init_wrapper])
-        return ASTNode("FieldDecl", f"{type_tok} {name}", [])
+        decls = []
+        while True:
+            if not (self.current and self.current.type == "IDENTIFIER"):
+                break
+            name = self.current.text; self.advance()
+
+            init = None
+            if self.accept("ASSIGN"):
+                if self.current and self.current.type == "NEW":
+                    self.advance()
+                    if self.current and (self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER"):
+                        _ = self.current.text; self.advance()
+                        _ = self._maybe_generic_suffix(_)
+                    while self.current and self.current.type == "LBRACK":
+                        self.advance()
+                        if self.current and self.current.type != "RBRACK":
+                            _ = self.parse_expression()
+                        self.match("RBRACK")
+                    if self.current and self.current.type == "LBRACE":
+                        self.advance()
+                        elems = []
+                        while self.current and self.current.type != "RBRACE":
+                            elems.append(self.parse_expression())
+                            if self.current and self.current.type == "COMMA":
+                                self.advance()
+                        self.match("RBRACE")
+                        init = ASTNode("ArrayInit", None, elems)
+                    else:
+                        init = ASTNode("Unknown", "new-array")
+                elif self.current and self.current.type == "LBRACE":
+                    self.advance()
+                    elems = []
+                    while self.current and self.current.type != "RBRACE":
+                        elems.append(self.parse_expression())
+                        if self.current and self.current.type == "COMMA":
+                            self.advance()
+                    self.match("RBRACE")
+                    init = ASTNode("ArrayInit", None, elems)
+                else:
+                    init = self.parse_expression()
+
+            fd = ASTNode("FieldDecl", f"{type_tok} {name}", [])
+            if init is not None:
+                fd.children.append(ASTNode("Init", None, [init]))
+            decls.append(fd)
+
+            if self.current and self.current.type == "COMMA":
+                self.advance()
+                continue
+            break
+
+        return decls[0] if len(decls) == 1 else ASTNode("Block", children=decls)
 
     # --------------- methods ---------------
     def parse_method_declaration(self):
         modifiers = []
         while self.current is not None and self.current.type in self.MODIFIERS:
-            modifiers.append(self.current.type)
-            self.advance()
+            modifiers.append(self.current.type); self.advance()
 
         ret_type = None
         if self.current is not None and (self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER" or self.current.type == "VOID"):
-            ret_type = self.current.text
-            self.advance()
-            # support return type arrays
+            ret_type = self.current.text; self.advance()
             while self.current is not None and self.current.type == "LBRACK":
                 self.advance()
                 if self.current and self.current.type == "RBRACK":
-                    ret_type = (ret_type or "") + "[]"
-                    self.advance()
+                    ret_type = (ret_type or "") + "[]"; self.advance()
         else:
             ret_type = "<unknown>"
             if self.current is not None:
@@ -334,17 +422,13 @@ class SimpleJavaParser:
         method_name = self.current.text
         self.match("IDENTIFIER")
 
-        # params
         self.match("LPAREN")
         params = self.parse_parameter_list()
         self.match("RPAREN")
 
-        # body (may be absent)
         body = []
         if self.current and self.current.type == "LBRACE":
             body = self.parse_block()
-        else:
-            body = []
 
         node = ASTNode("MethodDecl", f"{ret_type} {method_name}", params + body)
         if modifiers:
@@ -355,28 +439,21 @@ class SimpleJavaParser:
         params = []
         while self.current is not None and self.current.type not in ("RPAREN", Token.EOF):
             if self.current.type in self.MODIFIERS:
-                # skip unexpected modifiers in params
-                self.advance()
-                continue
+                self.advance(); continue
             if self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER":
-                p_type = self.current.text
-                self.advance()
+                p_type = self.current.text; self.advance()
                 while self.current and self.current.type == "LBRACK":
                     self.advance()
                     if self.current and self.current.type == "RBRACK":
-                        p_type = (p_type or "") + "[]"
-                        self.advance()
+                        p_type = (p_type or "") + "[]"; self.advance()
             else:
-                p_type = "<unknown>"
-                self.advance()
+                p_type = "<unknown>"; self.advance()
             p_name = None
             if self.current is not None and self.current.type == "IDENTIFIER":
-                p_name = self.current.text
-                self.advance()
+                p_name = self.current.text; self.advance()
             params.append(ASTNode("Param", f"{p_type} {p_name}"))
             if self.current is not None and self.current.type == "COMMA":
-                self.advance()
-                continue
+                self.advance(); continue
             else:
                 break
         return params
@@ -392,12 +469,43 @@ class SimpleJavaParser:
             stmts.append(self.parse_statement())
         if self.current is None or self.current.type == Token.EOF:
             raise SyntaxError("Reached EOF while parsing a block — missing '}'")
-        self.advance()  # consume RBRACE
+        self.advance()  # RBRACE
         return stmts
+
+    def _looks_like_local_decl_start(self) -> bool:
+        t1 = self._peek_token(1)
+        if t1 is None:
+            return False
+        if t1.type != "IDENTIFIER":
+            return False
+
+        i = 2
+
+        # generics <...>
+        if self.peek_type(i) == "LT":
+            depth = 0
+            while True:
+                tok = self._peek_token(i)
+                if tok is None:
+                    return False
+                if tok.type == "LT":
+                    depth += 1
+                elif tok.type == "GT":
+                    depth -= 1
+                i += 1
+                if depth == 0:
+                    break
+
+        # массивные []
+        while self.peek_type(i) == "LBRACK" and self.peek_type(i + 1) == "RBRACK":
+            i += 2
+
+        return self.peek_type(i) == "IDENTIFIER"
 
     def parse_statement(self):
         if self.current is None:
             return ASTNode("Empty")
+
         if self.current.type == "IF":
             return self.parse_if_statement()
         if self.current.type == "SWITCH":
@@ -408,6 +516,8 @@ class SimpleJavaParser:
             return self.parse_while_statement()
         if self.current.type == "DO":
             return self.parse_do_while_statement()
+        if self.current.type == "TRY":
+            return self.parse_try_statement()
         if self.current.type == "BREAK":
             self.advance()
             if self.current and self.current.type == "SEMI":
@@ -429,36 +539,59 @@ class SimpleJavaParser:
         if self.current.type == "LBRACE":
             stmts = self.parse_block()
             return ASTNode("Block", children=stmts)
+
+        # локальные объявления простых типов
         if self.current.type in self.TYPE_KEYWORDS:
-            # local variable declaration
-            return self.parse_field_declaration()
+            node = self.parse_field_declaration()
+            return node
 
-        # === NEW: recognize local declarations when type is an IDENTIFIER (e.g. "String a = ...") ===
-        # if pattern: IDENTIFIER IDENTIFIER ...  OR IDENTIFIER LBRACK ... IDENTIFIER (arrays), treat as local var decl
-        if self.current.type == "IDENTIFIER":
-            next_t = self.peek_type(2)
-            if next_t == "IDENTIFIER" or next_t == "LBRACK":
-                node = self.parse_local_variable_declaration_no_semi()
-                # consume optional trailing semicolon
-                if self.current and self.current.type == "SEMI":
-                    self.advance()
-                return node
-        # === end new recognition ===
-
-        # expression statement or assignment
-        expr = self.parse_expression()
-        # assignment handled here: if ASSIGN token follows primary expr, create Assign node
-        if self.current is not None and self.current.type == "ASSIGN":
-            self.advance()
-            right = self.parse_expression()
-            node = ASTNode("Assign", None, [expr, right])
+        # локальные объявления пользовательских/дженерик типов
+        if self.current.type == "IDENTIFIER" and self._looks_like_local_decl_start():
+            node = self.parse_local_variable_declaration_no_semi()
             if self.current and self.current.type == "SEMI":
                 self.advance()
             return node
-        # skip trailing semicolon if present
+
+        # выражение / присваивание / составное присваивание
+        left = self.parse_expression()
+
+        # простое присваивание
+        if self.current is not None and self.current.type == "ASSIGN":
+            self.advance()
+            right = self.parse_expression()
+            node = ASTNode("Assign", None, [left, right])
+            if self.current and self.current.type == "SEMI":
+                self.advance()
+            return node
+
+        # составные присваивания
+        compound = {
+            "ADD_ASSIGN": "ADD",
+            "SUB_ASSIGN": "SUB",
+            "MUL_ASSIGN": "MUL",
+            "DIV_ASSIGN": "DIV",
+            "MOD_ASSIGN": "MOD",
+            "AND_ASSIGN": "BITAND",
+            "OR_ASSIGN":  "BITOR",
+            "XOR_ASSIGN": "CARET",
+            "LSHIFT_ASSIGN": "LSHIFT",
+            "RSHIFT_ASSIGN": "RSHIFT",
+            "URSHIFT_ASSIGN": "URSHIFT",
+        }
+        if self.current is not None and self.current.type in compound:
+            op = compound[self.current.type]
+            self.advance()
+            rhs = self.parse_expression()
+            # превращаем `a <op>= b` в Assign( a , BinaryOp(<op>, [a, b]) )
+            node = ASTNode("Assign", None, [left, ASTNode("BinaryOp", op, [left, rhs])])
+            if self.current and self.current.type == "SEMI":
+                self.advance()
+            return node
+
+        # точка с запятой после выражения
         if self.current and self.current.type == "SEMI":
             self.advance()
-        return ASTNode("ExprStmt", None, [expr])
+        return ASTNode("ExprStmt", None, [left])
 
     def parse_if_statement(self):
         self.match("IF")
@@ -478,19 +611,56 @@ class SimpleJavaParser:
                 else_node = ASTNode("Else", children=[else_stmt])
         return ASTNode("IfStatement", cond, [then_block] + ([else_node] if else_node else []))
 
-    # --------------- expressions (precedence climbing) ---------------
+    # --------------- try/catch/finally ---------------
+    def parse_try_statement(self):
+        self.match("TRY")
+        try_block = ASTNode("TryBlock", None, self.parse_block())
+
+        catches = []
+        while self.current and self.current.type == "CATCH":
+            self.advance()
+            self.match("LPAREN")
+            ex_type = None
+            var_name = None
+            if self.current and (self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER"):
+                ex_type = self.current.text
+                self.advance()
+            if self.current and self.current.type == "IDENTIFIER":
+                var_name = self.current.text
+                self.advance()
+            self.match("RPAREN")
+            catch_block = self.parse_block()
+            catches.append(ASTNode("Catch", f"{ex_type} {var_name}".strip(), catch_block))
+
+        finally_node = None
+        if self.accept("FINALLY"):
+            finally_block = self.parse_block()
+            finally_node = ASTNode("Finally", None, finally_block)
+
+        children = [try_block] + catches + ([finally_node] if finally_node else [])
+        return ASTNode("TryStatement", None, children)
+
+    # --------------- expressions ---------------
     def parse_expression(self, min_prec=0):
         left = self.parse_primary()
         while True:
             if self.current is None:
                 break
+            # тернарный ?:  (низкий приоритет, право-ассоциативный)
+            if self.current.type == "QUESTION":
+                self.advance()
+                texpr = self.parse_expression()
+                self.match("COLON")
+                fexpr = self.parse_expression(min_prec)
+                left = ASTNode("Ternary", None, [left, texpr, fexpr])
+                continue
+
             op_type = self.current.type
             prec = self.PRECEDENCE.get(op_type, -1)
             if prec < min_prec:
                 break
             op_tok = self.current
             self.advance()
-            # handle right operand with precedence climbing
             right = self.parse_expression(prec + 1)
             left = ASTNode("BinaryOp", op_tok.type, [left, right])
         return left
@@ -498,26 +668,37 @@ class SimpleJavaParser:
     def parse_primary(self):
         if self.current is None:
             return ASTNode("Empty")
-        # prefix ++/--
-        if self.current.type in ("INC", "DEC"):
+
+        # префиксные унарные: ++ -- ! + - ~
+        if self.current.type in ("INC", "DEC", "BANG", "ADD", "SUB", "TILDE"):
             op = self.current.type
             self.advance()
             operand = self.parse_primary()
             return ASTNode("PrefixOp", op, [operand])
-        # parenthesis
+
+        # ( ... )
         if self.current.type == "LPAREN":
             self.advance()
             expr = self.parse_expression()
             self.match("RPAREN")
             return expr
-        # literals
+
+        # числовые/строковые/символьные
         if self.current.type in ("NUMBER", "STRING", "CHAR"):
             val = self.current.text
             self.advance()
             return ASTNode("Literal", val)
-        # identifier, method calls, member access, postfix ++/--
-        if self.current.type == "IDENTIFIER":
-            base = ASTNode("Identifier", self.current.text)
+
+        # булевы и null как литералы (если лексер выделяет их отдельными токенами)
+        if self.current.type in ("TRUE", "FALSE", "NULL"):
+            lit = self.current.text
+            self.advance()
+            return ASTNode("Literal", lit)
+
+        # идентификатор/this/super, вызовы, член‑доступ, постфикс ++/--
+        if self.current.type in ("IDENTIFIER", "THIS", "SUPER"):
+            name = self.current.text.lower() if self.current.type in ("THIS", "SUPER") else self.current.text
+            base = ASTNode("Identifier", name)
             self.advance()
             while True:
                 if self.current is not None and self.current.type == "DOT":
@@ -529,7 +710,6 @@ class SimpleJavaParser:
                         continue
                     break
                 if self.current is not None and self.current.type == "LPAREN":
-                    # call
                     self.advance()
                     args = []
                     if self.current is not None and self.current.type != "RPAREN":
@@ -547,7 +727,8 @@ class SimpleJavaParser:
                     continue
                 break
             return base
-        # unknown token fallback
+
+        # fallback
         token_text = getattr(self.current, "text", None)
         token_type = getattr(self.current, "type", None)
         self.advance()
@@ -574,11 +755,10 @@ class SimpleJavaParser:
         return ASTNode("DoWhileStatement", children=[condition, body])
 
     def parse_for_statement(self):
-        # detect foreach (type id : expr) vs classic (init ; cond ; update)
         self.match("FOR")
         self.match("LPAREN")
 
-        # scan ahead up to RPAREN to find a COLON before the first semicolon
+        # ищем foreach (':' до первой ';')
         lookahead_index = 1
         found_colon = False
         while True:
@@ -593,20 +773,16 @@ class SimpleJavaParser:
             lookahead_index += 1
 
         if found_colon:
-            # foreach style: (Type id : expr)
             first_type = None
             if self.current.type in self.TYPE_KEYWORDS or self.current.type == "IDENTIFIER":
-                first_type = self.current.text
-                self.advance()
+                first_type = self.current.text; self.advance()
                 while self.current and self.current.type == "LBRACK":
                     self.advance()
                     if self.current and self.current.type == "RBRACK":
-                        first_type = (first_type or "") + "[]"
-                        self.advance()
+                        first_type = (first_type or "") + "[]"; self.advance()
             var_name = None
             if self.current.type == "IDENTIFIER":
-                var_name = self.current.text
-                self.advance()
+                var_name = self.current.text; self.advance()
             self.match("COLON")
             collection_expr = self.parse_expression()
             self.match("RPAREN")
@@ -634,13 +810,12 @@ class SimpleJavaParser:
             raise SyntaxError("Ожидался ';' в заголовке for (между условием и обновлением)")
         update = None
         if self.current.type != "RPAREN":
-            # update может быть expression (включая постфикс INC/DEC)
             update = self.parse_expression()
         self.match("RPAREN")
         body = ASTNode("Block", children=self.parse_block())
         return ASTNode("ForStatement", children=[init, condition, update, body])
 
-    # --------------- switch / case ---------------
+    # --------------- switch ---------------
     def parse_switch_statement(self):
         self.match("SWITCH")
         self.match("LPAREN")
@@ -656,7 +831,6 @@ class SimpleJavaParser:
                 if self.current and self.current.type == "COLON":
                     self.advance()
                 stmts = []
-                # collect statements until next CASE/DEFAULT/RBRACE
                 while self.current is not None and self.current.type not in ("CASE", "DEFAULT", "RBRACE"):
                     stmts.append(self.parse_statement())
                 cases.append(ASTNode("CaseLabel", None, [case_val] + stmts))
@@ -669,7 +843,6 @@ class SimpleJavaParser:
                     stmts.append(self.parse_statement())
                 cases.append(ASTNode("DefaultLabel", None, stmts))
             else:
-                # skip unexpected
                 self.advance()
         if self.current and self.current.type == "RBRACE":
             self.advance()
